@@ -1,10 +1,10 @@
 import pandas as pd          
-from pipelines.config import Config
+from pipelines.configs.config import Config
 from pathlib import Path
 import hashlib
 import re
 import argparse
-from pipelines.s3_client import s3Client
+from pipelines.clients.s3_client import s3Client
 from tqdm import tqdm
     
 
