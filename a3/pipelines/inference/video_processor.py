@@ -52,29 +52,34 @@ class VideoProcessor:
             frame_count = 0
             extracted_count = 0
             
+            # Use grab()/retrieve() to avoid decoding frames we will skip
             while True:
-                ret, frame = cap.read()
-                if not ret:
+                grabbed = cap.grab()
+                if not grabbed:
                     break
-                
+
                 if frame_count % frame_interval == 0:
+                    ok, frame = cap.retrieve()
+                    if not ok:
+                        frame_count += 1
+                        continue
                     timestamp = frame_count / video_fps
                     frame_filename = f"frame_{frame_count:06d}.jpg"
                     frame_path = output_path / frame_filename
-                    
+
                     cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    
+
                     frame_id = hashlib.sha256(f"{video_path}_{frame_count}".encode()).hexdigest()
-                    
+
                     frames_metadata.append({
                         "frame_id": frame_id,
                         "frame_number": frame_count,
                         "timestamp": round(timestamp, 3),
                         "file_path": str(frame_path)
                     })
-                    
+
                     extracted_count += 1
-                
+
                 frame_count += 1
             
             cap.release()

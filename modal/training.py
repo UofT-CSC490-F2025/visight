@@ -159,6 +159,9 @@ def export_onnx(best_weights: Path, run_dir: Path, img_size: int) -> Optional[Pa
         model_best = YOLO(str(best_weights))
         # This writes under run_dir by default
         model_best.export(format="onnx", imgsz=img_size, opset=12, dynamic=True)
+        candidate = run_dir / "weights" / "best.onnx"
+        if candidate.exists():
+            return candidate
         onnx_files = list(run_dir.rglob("*.onnx"))
         return onnx_files[0] if onnx_files else None
     except Exception as e:
@@ -226,11 +229,15 @@ def copy_training_artifacts_to_s3(
         _safe_copy_file(best_pt, best_pt_s3)
 
         # ONNX (if present)
-        onnx_files = list(run_dir.rglob("*.onnx"))
         onnx_s3: Optional[Path] = None
-        if onnx_files:
+        best_onnx = run_dir / "weights" / "best.onnx"
+        if not best_onnx.exists():
+            # Fallback to scan if layout differs
+            onnx_files = list(run_dir.rglob("*.onnx"))
+            best_onnx = onnx_files[0] if onnx_files else None
+        if best_onnx and best_onnx.exists():
             onnx_s3 = s3_models_root / "best.onnx"
-            _safe_copy_file(onnx_files[0], onnx_s3)
+            _safe_copy_file(best_onnx, onnx_s3)
 
         # results.csv to stats/
         results_csv_s3: Optional[Path] = None
@@ -339,7 +346,7 @@ def train_yolo(
             device=0,                # single GPU
             batch=spec.batch,
             workers=spec.workers,
-            cache=False,             # keep False; we staged locally anyway
+            cache=True,              # enable cache now that data is staged locally
             project=str(RUNS_DIR),
             name=model_id,
             exist_ok=True,

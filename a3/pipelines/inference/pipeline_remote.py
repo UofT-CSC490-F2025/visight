@@ -382,29 +382,24 @@ class InferencePipeline:
         Returns:
             Dict with summary statistics
         """
-        total_detections = sum(r["detection_count"] for r in inference_results)
-        frames_with_detections = sum(1 for r in inference_results if r["detection_count"] > 0)
-        
-        # Count detections per class
+        total_detections = 0
+        frames_with_detections = 0
         class_counts = {}
+        class_conf_sum = {}
+        class_conf_n = {}
+
         for result in inference_results:
-            for det in result["detections"]:
-                class_name = det["class_name"]
-                class_counts[class_name] = class_counts.get(class_name, 0) + 1
-        
-        # Calculate average confidence per class
-        class_confidences = {}
-        for result in inference_results:
-            for det in result["detections"]:
-                class_name = det["class_name"]
-                if class_name not in class_confidences:
-                    class_confidences[class_name] = []
-                class_confidences[class_name].append(det["confidence"])
-        
-        avg_confidence_per_class = {
-            cls: sum(confs) / len(confs) 
-            for cls, confs in class_confidences.items()
-        }
+            n = result.get("detection_count", 0)
+            total_detections += n
+            if n > 0:
+                frames_with_detections += 1
+            for det in result.get("detections", []):
+                cls = det["class_name"]
+                class_counts[cls] = class_counts.get(cls, 0) + 1
+                class_conf_sum[cls] = class_conf_sum.get(cls, 0.0) + float(det["confidence"])
+                class_conf_n[cls] = class_conf_n.get(cls, 0) + 1
+
+        avg_confidence_per_class = {cls: (class_conf_sum[cls] / class_conf_n[cls]) for cls in class_counts}
         
         return {
             "total_frames": len(inference_results),
