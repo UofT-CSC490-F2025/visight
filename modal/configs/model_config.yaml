@@ -1,9 +1,9 @@
-dataset_version: "raw"
+dataset_version: "augmented"
 model_size: "yolov8s.pt"       # base checkpoint
-epochs: 1
-img_size: 1280
-batch: 0.95
-workers: 4
+epochs: 3
+img_size: 640
+batch: 24
+workers: 16
 seed: 117
 notes: "Initial train attempt: No hyperparameter tuning, small YOLO model"
 warmup_epochs: 0

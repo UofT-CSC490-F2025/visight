@@ -2,3 +2,4 @@ PyYAML
 ultralytics>=8.3.0
 opencv-python~=4.10.0
 future
+tensorboard
