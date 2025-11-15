@@ -150,6 +150,39 @@ def _resolve_batch_size(batch_value: Union[int, float, str], num_gpus: int) -> i
     return default
 
 
+def organize_run_outputs(run_dir: Path) -> None:
+    """Move Ultralytics-generated artifacts into clearer subdirectories."""
+    move_map = {
+        run_dir / "plots": [
+            "Box*.png",
+            "confusion_matrix*.png",
+            "results.png",
+            "labels.jpg",
+            "P_curve.png",
+            "R_curve.png",
+            "PR_curve.png",
+        ],
+        run_dir / "samples": [
+            "train_batch*.jpg",
+            "val_batch*.jpg",
+        ],
+        run_dir / "metadata": [
+            "args.yaml",
+            "model_card.json",
+            "data.yaml",
+        ],
+    }
+    for dest, patterns in move_map.items():
+        dest.mkdir(exist_ok=True)
+        for pattern in patterns:
+            for src in run_dir.glob(pattern):
+                dst = dest / src.name
+                if src == dst:
+                    continue
+                if src.exists():
+                    shutil.move(str(src), str(dst))
+
+
 def stage_dataset_from_s3(prefix: str, force_refresh: bool = False) -> Path:
     """
     Stage s3://BUCKET_NAME/{prefix} into a local working directory so that
@@ -510,9 +543,11 @@ def train_yolo(
             model_id=model_id,
             spec=spec,
             artifacts=artifacts,
-            data_yaml_local=data_yaml_path,
+            data_yaml_local=data_yaml_record,
         )
         _safe_copy_file(run_dir / "model_card.json", MOUNT_PATH / "models" / model_id / "model_card.json")
+
+        organize_run_outputs(run_dir)
 
         # Persist volume state
         vol.commit()
