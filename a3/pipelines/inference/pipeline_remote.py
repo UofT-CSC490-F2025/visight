@@ -321,6 +321,7 @@ class InferencePipeline:
         #     profile_file.write_text(s.getvalue())
         #     print(f"\n[PROFILING] _run_model_inference profile saved to: {profile_file}")
     
+    @profiled(name="draw_bounding_boxes", stats_limit=50)
     def _draw_bounding_boxes(self, frame_path: Path, detections: list, 
                             output_dir: Path) -> Path:
         """
@@ -372,6 +373,7 @@ class InferencePipeline:
         
         return output_path
     
+    @profiled(name="generate_summary_stats", stats_limit=50)
     def _generate_summary_stats(self, inference_results: list) -> dict:
         """
         Generate summary statistics from inference results
