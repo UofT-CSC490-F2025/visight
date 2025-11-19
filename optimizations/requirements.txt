@@ -1,0 +1,12 @@
+boto3
+Pillow
+pandas
+tqdm
+s3fs
+albumentations 
+opencv-python==4.10.0.84 
+fastapi
+numpy>=1.24,<2.0
+ultralytics==8.2.68
+pyyaml>=6.0
+modal

@@ -13,14 +13,12 @@ ENV = os.getenv("MODAL_ENV", "dev")
 INFRASTRUCTURE_CONFIG = {
     "dev": {
         "gpu": "T4",
-        "keep_warm": 0,
-        "concurrency_limit": 1,
+        "min_containers": 0,
         "max_containers": 2,
     },
     "prod": {
         "gpu": "T4",
-        "keep_warm": 1,
-        "concurrency_limit": 10,
+        "min_containers": 1,
         "max_containers": 20,
     }
 }
@@ -137,13 +135,14 @@ def extract_file_id(share_link):
 
 class InferenceRequest(BaseModel):
     video_url: str
-    fps: Optional[int] = 1
+    fps: Optional[int] = 12
     confidence_threshold: Optional[float] = 0.5
+    batch_size: Optional[int] = 200
 
 @app.function(
     **INFRASTRUCTURE_CONFIG[ENV],
     cpu=2,
-    timeout=60 * 10,
+    timeout=3000,
     volumes={MOUNT_PATH: modal.CloudBucketMount(BUCKET_NAME, secret=S3_SECRET)},
     secrets=[S3_SECRET],
 )
@@ -169,7 +168,8 @@ def inference(request: InferenceRequest, save_to_s3: bool = False):
         model_path=model_path / "best.pt",
         fps=request.fps,
         confidence_threshold=request.confidence_threshold, 
-        logger=logger
+        logger=logger, 
+        batch_size=request.batch_size
     )
     
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")

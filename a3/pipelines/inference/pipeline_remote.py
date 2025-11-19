@@ -10,51 +10,24 @@ from pathlib import Path
 from pipelines.clients.s3_client import s3Client
 from typing import Optional
 import logging
+import math
 import cProfile
 import pstats
 from io import StringIO
 from datetime import datetime, timezone
-
-"""
-Profiling utilities (stdlib cProfile)
-"""
-def profiled(name: Optional[str] = None, stats_limit: int = 50, outdir: Optional[Path] = None):
-    """Decorator that profiles a function with cProfile and writes stats.
-
-    - Sorts by cumulative time as per docs.
-    - Writes to /data/profiling by default (Modal container path).
-    - Filenames include function name and UTC timestamp.
-    """
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            profiler = cProfile.Profile()
-            profiler.enable()
-            try:
-                return func(*args, **kwargs)
-            finally:
-                profiler.disable()
-                s = StringIO()
-                pstats.Stats(profiler, stream=s).sort_stats('cumulative').print_stats(stats_limit)
-                ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-                output_dir = outdir or Path("/data/profiling")
-                output_dir.mkdir(parents=True, exist_ok=True)
-                fname = f"{(name or func.__name__)}_{ts}.txt"
-                profile_file = output_dir / fname
-                profile_file.write_text(s.getvalue())
-                print(f"\n[PROFILING] {func.__name__} profile saved to: {profile_file}")
-        return wrapper
-    return decorator
 
 class InferencePipeline:
     """
     Main inference pipeline for video logo detection
     """
     
-    def __init__(self, model_path: str, fps: int = None, confidence_threshold: float = 0.5, logger:Optional[logging.Logger] = None):
+    def __init__(self, model_path: str, fps: int = None, 
+                 confidence_threshold: float = 0.5, logger:Optional[logging.Logger] = None, batch_size: int = 80):
         self.video_processor = VideoProcessor(fps=fps)
         self.confidence_threshold = confidence_threshold        
         self.model = YOLO(model_path)
         self.logger = logger
+        self.batch_size = batch_size
     
     def run_inference_on_video(self, video_path: str, video_id: str, 
                                s3_bucket: Optional[str] = None, 
@@ -141,6 +114,7 @@ class InferencePipeline:
             frames_dir, 
             annotated_dir
         )
+        print("INFERENCE RESULTS:", len(inference_results))
         
         # Step 6: Upload annotated frames to S3
         if s3_client and save_annotated_frames and annotated_dir:
@@ -211,7 +185,6 @@ class InferencePipeline:
         else: print(msg)
         
         res_dirs = ([annotated_dir] if annotated_dir else []) + [frames_dir.parent / "profiling"] # [Path("/data/profiling")]
-        
         return res_dirs, res_summary_path
     
     def _run_model_inference(self, frames_metadata: list, frames_dir: Path, 
@@ -244,39 +217,12 @@ class InferencePipeline:
         """
         profiler = cProfile.Profile()
         profiler.enable()
-        
         try:
-            # detections = self.model.predict([f["file_path"] for f in frames_metadata], verbose=False, stream=True)
+            batches = self._split_into_batches(frames_metadata)
             results = []
-            for frame_meta in tqdm(frames_metadata, desc="Inference"):
-                # frame_meta = frames_metadata[i]
-                frame_path = Path(frame_meta["file_path"])
-                frame_detections = next(self.model.predict([frame_meta["file_path"]], 
-                                                        conf=self.confidence_threshold, verbose=False, stream=True))
-                name_map = frame_detections.names
-                
-                # Filter by confidence threshold
-                detection_data = frame_detections.boxes.data.tolist()
-                detection_info = [{"bbox": d[:4], "confidence":d[4], "class_name":name_map[d[5]]} for d in detection_data]
-                
-                result = {
-                    "frame_id": frame_meta["frame_id"],
-                    "frame_number": frame_meta["frame_number"],
-                    "timestamp": frame_meta["timestamp"],
-                    "detections": detection_info,
-                    "detection_count": len(detection_info)
-                }
-                
-                # Draw bounding boxes on frame if requested
-                if annotated_dir and len(detection_info) > 0:
-                    annotated_path = self._draw_bounding_boxes(
-                        frame_path, 
-                        detection_info, 
-                        annotated_dir
-                    )
-                    result["annotated_frame_path"] = str(annotated_path)
-                    
-                results.append(result)
+            for i in range(len(batches)): 
+                results.extend(self._minibatch_inference(i, batches[i]["paths"], batches[i]["frame_meta"], annotated_dir))
+            
             return results
         finally:
             profiler.disable()
@@ -291,8 +237,89 @@ class InferencePipeline:
             profile_output_dir = frames_dir.parent / "profiling"
             profile_output_dir.mkdir(parents=True, exist_ok=True)
             profile_file = profile_output_dir / f"run_model_inference_{timestamp}.txt"
+            # with open(profile_file, 'w') as f:
+            #     f.write(s.getvalue())
             profile_file.write_text(s.getvalue())
             print(f"\n[PROFILING] _run_model_inference profile saved to: {profile_file}")
+    
+    def _split_into_batches(self, frames_metadata: list): 
+        batches = []
+        num_batches = math.ceil(len(frames_metadata)/self.batch_size)
+        for i in range(num_batches): 
+            start_i = i*self.batch_size
+            end_i = min((i + 1) * self.batch_size, len(frames_metadata))
+            metadata_slice = frames_metadata[start_i:end_i]
+            batches.append({"paths":[f["file_path"] for f in metadata_slice],
+                            "frame_meta": metadata_slice})
+        
+        return batches
+    
+    def _minibatch_inference(self, batch_index: int, frame_paths: list[str], file_meta: list[dict], annotated_dir: Path = None):
+        # profiler = cProfile.Profile()
+        # profiler.enable()
+        # try:
+        all_dets = self.model.predict(frame_paths, conf=self.confidence_threshold, verbose=False, stream=True)
+        # finally:
+        #     profiler.disable()
+            
+        #     # Save profiling stats
+        #     s = StringIO()
+        #     ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+        #     ps.print_stats(50)  # Top 50 functions
+            
+        #     # Save profile to frames directory parent
+        #     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        #     profile_output_dir = Path("/data/profiling")
+        #     profile_output_dir.mkdir(parents=True, exist_ok=True)
+        #     profile_file = profile_output_dir / f"minibatch_inference_{timestamp}.txt"
+        #     profile_file.write_text(s.getvalue())
+        #     print(f"\n[PROFILING] minibatch_inference profile saved to: {profile_file}")
+        return self._process_inference_res(batch_index, all_dets, file_meta, annotated_dir)
+    
+    def _process_inference_res(self, batch_index: int, all_dets, file_meta: list[dict], annotated_dir: Path = None): 
+        # profiler = cProfile.Profile()
+        # profiler.enable()
+        # try:
+        results = []
+        i = 0
+        for det in tqdm(all_dets, total=len(file_meta), desc=f"Batch {batch_index} Processing"): 
+            name_map = det.names
+            detection_data = det.boxes.data.tolist()
+            detection_info = [{"bbox": d[:4], "confidence":d[4], "class_name":name_map[d[5]]} for d in detection_data]
+            result = {
+                "frame_id": file_meta[i]["frame_id"],
+                "frame_number": file_meta[i]["frame_number"],
+                "timestamp": file_meta[i]["timestamp"],
+                "detections": detection_info,
+                "detection_count": len(detection_info)
+            }
+            if annotated_dir and len(detection_info) > 0:
+                annotated_path = self._draw_bounding_boxes(
+                    Path(file_meta[i]["file_path"]), 
+                    detection_info, 
+                    annotated_dir
+                )
+                result["annotated_frame_path"] = str(annotated_path)
+                
+            results.append(result)
+            i += 1
+            
+        return results
+        # finally:
+        #     profiler.disable()
+            
+        #     # Save profiling stats
+        #     s = StringIO()
+        #     ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+        #     ps.print_stats(50)  # Top 50 functions
+            
+        #     # Save profile to frames directory parent
+        #     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        #     profile_output_dir = Path("/data/profiling")
+        #     profile_output_dir.mkdir(parents=True, exist_ok=True)
+        #     profile_file = profile_output_dir / f"inference_res_processing_{timestamp}.txt"
+        #     profile_file.write_text(s.getvalue())
+        #     print(f"\n[PROFILING] _run_model_inference profile saved to: {profile_file}")
     
     @profiled(name="draw_bounding_boxes", stats_limit=50)
     def _draw_bounding_boxes(self, frame_path: Path, detections: list, 
@@ -357,29 +384,24 @@ class InferencePipeline:
         Returns:
             Dict with summary statistics
         """
-        total_detections = sum(r["detection_count"] for r in inference_results)
-        frames_with_detections = sum(1 for r in inference_results if r["detection_count"] > 0)
-        
-        # Count detections per class
+        total_detections = 0
+        frames_with_detections = 0
         class_counts = {}
+        class_conf_sum = {}
+        class_conf_n = {}
+
         for result in inference_results:
-            for det in result["detections"]:
-                class_name = det["class_name"]
-                class_counts[class_name] = class_counts.get(class_name, 0) + 1
-        
-        # Calculate average confidence per class
-        class_confidences = {}
-        for result in inference_results:
-            for det in result["detections"]:
-                class_name = det["class_name"]
-                if class_name not in class_confidences:
-                    class_confidences[class_name] = []
-                class_confidences[class_name].append(det["confidence"])
-        
-        avg_confidence_per_class = {
-            cls: sum(confs) / len(confs) 
-            for cls, confs in class_confidences.items()
-        }
+            n = result.get("detection_count", 0)
+            total_detections += n
+            if n > 0:
+                frames_with_detections += 1
+            for det in result.get("detections", []):
+                cls = det["class_name"]
+                class_counts[cls] = class_counts.get(cls, 0) + 1
+                class_conf_sum[cls] = class_conf_sum.get(cls, 0.0) + float(det["confidence"])
+                class_conf_n[cls] = class_conf_n.get(cls, 0) + 1
+
+        avg_confidence_per_class = {cls: (class_conf_sum[cls] / class_conf_n[cls]) for cls in class_counts}
         
         return {
             "total_frames": len(inference_results),

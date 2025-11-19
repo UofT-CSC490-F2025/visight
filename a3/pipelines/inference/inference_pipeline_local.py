@@ -1,8 +1,13 @@
 import argparse
+import cProfile
+import pstats
+from io import StringIO
 from pathlib import Path
 import json
 import tempfile
 import cv2
+from datetime import datetime, timezone
+from typing import Optional, List
 from pipelines.inference.video_processor import VideoProcessor
 from tqdm import tqdm
 from ultralytics import YOLO
@@ -19,11 +24,12 @@ class InferencePipeline:
     Main inference pipeline for video logo detection
     """
     
-    def __init__(self, s3_bucket: str, model_key: str, fps: int = None, confidence_threshold: float = 0.5):
+    def __init__(self, s3_bucket: str, model_key: str, fps: int = None, confidence_threshold: float = 0.5, batch_size: Optional[int] = None):
         self.s3_client = s3Client(buckets=[s3_bucket])
         self.video_processor = VideoProcessor(fps=fps)
         self.bucket = s3_bucket
         self.confidence_threshold = confidence_threshold
+        self.batch_size = batch_size
         
         pt_weights = self.s3_client.get_object(model_key)
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as tmp_file:
@@ -191,46 +197,76 @@ class InferencePipeline:
                 "detection_count": int,
                 "annotated_frame_path": str (if annotated_dir provided)
             }
+            
+        PROFILED FUNCTION
         """
         profiler = cProfile.Profile()
         profiler.enable()
+        
         try:
             print("Running model inference...")
-            # detections = self.model.predict([f["file_path"] for f in frames_metadata], verbose=False, stream=True)
             results = []
-            for frame_meta in tqdm(frames_metadata, desc="Inference"):
-                frame_path = Path(frame_meta["file_path"])
-                frame_detections = next(self.model.predict([frame_meta["file_path"]], 
-                                                           conf=self.confidence_threshold, verbose=False, stream=True))
-                name_map = frame_detections.names
-                
-                # Filter by confidence threshold
-                detection_data = frame_detections.boxes.data.tolist()
-                detection_info = [{"bbox": d[:4], "confidence":d[4], "class_name":name_map[d[5]]} for d in detection_data]
-                
-                result = {
-                    "frame_id": frame_meta["frame_id"],
-                    "frame_number": frame_meta["frame_number"],
-                    "timestamp": frame_meta["timestamp"],
-                    "detections": detection_info,
-                    "detection_count": len(detection_info)
-                }
-                
-                # Draw bounding boxes on frame if requested
-                if annotated_dir and len(detection_info) > 0:
-                    annotated_path = self._draw_bounding_boxes(
-                        frame_path, 
-                        detection_info, 
-                        annotated_dir
-                    )
-                    result["annotated_frame_path"] = str(annotated_path)
-                
-                results.append(result)
+
+            # Use batched prediction when batch_size > 1
+            effective_bs = self.batch_size if (self.batch_size and self.batch_size > 1) else None
+
+            if not effective_bs:
+                for frame_meta in tqdm(frames_metadata, desc="Inference"):
+                    frame_path = Path(frame_meta["file_path"])
+                    frame_detections = next(self.model.predict([frame_meta["file_path"]],
+                                                               conf=self.confidence_threshold, verbose=False, stream=True))
+                    name_map = frame_detections.names
+                    detection_data = frame_detections.boxes.data.tolist()
+                    detection_info = [{"bbox": d[:4], "confidence": d[4], "class_name": name_map[d[5]]} for d in detection_data]
+                    result = {
+                        "frame_id": frame_meta["frame_id"],
+                        "frame_number": frame_meta["frame_number"],
+                        "timestamp": frame_meta["timestamp"],
+                        "detections": detection_info,
+                        "detection_count": len(detection_info)
+                    }
+                    if annotated_dir and len(detection_info) > 0:
+                        annotated_path = self._draw_bounding_boxes(frame_path, detection_info, annotated_dir)
+                        result["annotated_frame_path"] = str(annotated_path)
+                    results.append(result)
+                return results
+
+            # Batched path
+            def chunk(items: List[dict], n: int):
+                for i in range(0, len(items), n):
+                    yield items[i:i+n]
+
+            for batch in tqdm(list(chunk(frames_metadata, effective_bs)), desc=f"Inference (batch={effective_bs})"):
+                paths = [f["file_path"] for f in batch]
+                all_dets = self.model.predict(paths, conf=self.confidence_threshold, verbose=False, stream=True)
+                i = 0
+                for det in all_dets:
+                    name_map = det.names
+                    detection_data = det.boxes.data.tolist()
+                    detection_info = [{"bbox": d[:4], "confidence": d[4], "class_name": name_map[d[5]]} for d in detection_data]
+                    meta = batch[i]
+                    result = {
+                        "frame_id": meta["frame_id"],
+                        "frame_number": meta["frame_number"],
+                        "timestamp": meta["timestamp"],
+                        "detections": detection_info,
+                        "detection_count": len(detection_info)
+                    }
+                    if annotated_dir and len(detection_info) > 0:
+                        annotated_path = self._draw_bounding_boxes(Path(meta["file_path"]), detection_info, annotated_dir)
+                        result["annotated_frame_path"] = str(annotated_path)
+                    results.append(result)
+                    i += 1
             return results
         finally:
             profiler.disable()
+            
+            # Save profiling stats
             s = StringIO()
-            pstats.Stats(profiler, stream=s).sort_stats('cumulative').print_stats(50)
+            ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+            ps.print_stats(50)  # Top 50 functions
+            
+            # Save profile to frames directory parent
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             profile_output_dir = frames_dir.parent / "profiling"
             profile_output_dir.mkdir(parents=True, exist_ok=True)
@@ -299,29 +335,24 @@ class InferencePipeline:
         Returns:
             Dict with summary statistics
         """
-        total_detections = sum(r["detection_count"] for r in inference_results)
-        frames_with_detections = sum(1 for r in inference_results if r["detection_count"] > 0)
-        
-        # Count detections per class
+        total_detections = 0
+        frames_with_detections = 0
         class_counts = {}
+        class_conf_sum = {}
+        class_conf_n = {}
+
         for result in inference_results:
-            for det in result["detections"]:
-                class_name = det["class_name"]
-                class_counts[class_name] = class_counts.get(class_name, 0) + 1
-        
-        # Calculate average confidence per class
-        class_confidences = {}
-        for result in inference_results:
-            for det in result["detections"]:
-                class_name = det["class_name"]
-                if class_name not in class_confidences:
-                    class_confidences[class_name] = []
-                class_confidences[class_name].append(det["confidence"])
-        
-        avg_confidence_per_class = {
-            cls: sum(confs) / len(confs) 
-            for cls, confs in class_confidences.items()
-        }
+            n = result.get("detection_count", 0)
+            total_detections += n
+            if n > 0:
+                frames_with_detections += 1
+            for det in result.get("detections", []):
+                cls = det["class_name"]
+                class_counts[cls] = class_counts.get(cls, 0) + 1
+                class_conf_sum[cls] = class_conf_sum.get(cls, 0.0) + float(det["confidence"])
+                class_conf_n[cls] = class_conf_n.get(cls, 0) + 1
+
+        avg_confidence_per_class = {cls: (class_conf_sum[cls] / class_conf_n[cls]) for cls in class_counts}
         
         return {
             "total_frames": len(inference_results),
@@ -344,6 +375,7 @@ def main():
     parser.add_argument("--bucket", default="visight-data-yusufmoola", help="S3 bucket name")
     parser.add_argument("--fps", type=int, help="Target FPS for frame extraction (default: all frames)")
     parser.add_argument("--confidence", type=float, default=0.5, help="Confidence threshold for detections")
+    parser.add_argument("--batch_size", type=int, default=0, help="Batch size for batched inference (0 or 1 = per-frame)")
     parser.add_argument("--no_upload", action="store_true", help="Skip uploading to S3")
     parser.add_argument("--no_annotate", action="store_true", help="Skip saving annotated frames")
     
@@ -357,7 +389,8 @@ def main():
         s3_bucket=args.bucket, 
         model_key=args.model_key,
         fps=args.fps,
-        confidence_threshold=args.confidence
+        confidence_threshold=args.confidence,
+        batch_size=(args.batch_size if args.batch_size and args.batch_size > 1 else None)
     )
     
     result = pipeline.run_inference_on_video(
